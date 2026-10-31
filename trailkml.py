@@ -10,15 +10,46 @@ OSM（api.openstreetmap.org）と国土地理院（cyberjapandata.gsi.go.jp）�
   地点は「緯度,経度」「度分秒」「地点名（地理院の地名検索→OSMの地点名の順に探す）」「山頂」のいずれか。
   山名は地理院の地名検索で位置を決める（同名の山は標高が最も高いものを使う）。
 """
-import argparse, heapq, io, json, math, re, statistics, sys, time
-VERSION = "2.1"
+import argparse, heapq, io, json, math, os, re, shlex, statistics, subprocess, sys, time
+VERSION = "2.2"
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
 UA = {"User-Agent": "mountain-trail-kml/1.0 (personal hiking route tool)"}
 GSI = "https://cyberjapandata.gsi.go.jp/xyz"
-FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc"
+FONT_DEFAULT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc"
+FONT_CANDIDATES = [
+    FONT_DEFAULT,
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Medium.ttc",
+    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Medium.ttc",
+    "/System/Library/Fonts/ヒラギノ角ゴシック W5.ttc",
+    "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc",
+    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+    "/Library/Fonts/NotoSansCJKjp-Medium.otf",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+]
+
+def find_font():
+    """日本語フォントを探す。既定の Linux パス → 代表的なパス → fc-match の順。見つからなければ None"""
+    for p in FONT_CANDIDATES:
+        if os.path.exists(p): return p
+    for pat in ("Noto Sans CJK JP:style=Medium", "Hiragino Sans", ":lang=ja"):
+        try:
+            r = subprocess.run(["fc-match", "-f", "%{file}", pat], capture_output=True, text=True, timeout=10)
+            f = r.stdout.strip()
+            if f and os.path.exists(f) and re.search(r"(?i)cjk|hiragino|ヒラギノ|gothic|ipa|takao|jp", f): return f
+        except Exception:
+            pass
+    return None
+
+FONT = find_font()
+
+def font(size):
+    if FONT: return ImageFont.truetype(FONT, size)
+    try: return ImageFont.load_default(size=size)
+    except TypeError: return ImageFont.load_default()
 S = requests.Session(); S.headers.update(UA)
 
 # ---------------------------------------------------------------- 基本
@@ -131,11 +162,14 @@ def locate_mountain(name):
     cands.sort(key=lambda c: -c["ele"])
     return cands[0]["lon"], cands[0]["lat"], cands
 
+PLACE_CANDS = {}   # 地名検索の候補（チェック用）
+
 def locate_place(name, center, max_km=15):
     """地点名 → center から max_km 以内で最も近い候補 (lon, lat, title)。なければ None"""
     hits = gsi_search(name)
     exact = [h for h in hits if h[0] == name] or [h for h in hits if name in h[0]]
     near = [h for h in exact if hav(center, (h[1], h[2])) <= max_km*1000]
+    PLACE_CANDS[name] = [(t, round(lo, 6), round(la, 6), round(hav(center, (lo, la))/1000, 1)) for t, lo, la in sorted(near, key=lambda h: hav(center, (h[1], h[2])))[:5]]
     if not near: return None
     t, lo, la = min(near, key=lambda h: hav(center, (h[1], h[2])))
     return lo, la, t
@@ -159,6 +193,7 @@ class OSM:
         self.nodes = {e["id"]: e for e in els if e["type"] == "node"}
         self.ways = {e["id"]: e for e in els if e["type"] == "way"}
         self.adj = {}
+        self.closed = [w["id"] for w in self.ways.values() if self.is_closed(w.get("tags", {}))]   # チェック用
         for w in self.ways.values():
             t = w.get("tags", {})
             if not self.HW.match(t.get("highway", "")): continue
@@ -170,8 +205,28 @@ class OSM:
                     d = hav(self.pos(a), self.pos(b))*pen
                     self.adj.setdefault(a, []).append((b, d, w["id"])); self.adj.setdefault(b, []).append((a, d, w["id"]))
     def pos(self, i): n = self.nodes[i]; return (n["lon"], n["lat"])
+    def is_closed(self, t):
+        """廃道・通行止めの道か（名前、または disused / abandoned のタグ）"""
+        hw = t.get("highway") or t.get("disused:highway") or t.get("abandoned:highway") or t.get("was:highway")
+        if not hw: return False
+        return bool(self.CLOSED.search(t.get("name", "")) or any(k == "disused" or k == "abandoned" or k.startswith(("disused:", "abandoned:")) for k in t)
+                    or t.get("highway") in ("disused", "abandoned"))
     def near(self, p):
         best = min(self.adj, key=lambda i: hav(p, self.pos(i))); return best, hav(p, self.pos(best))
+    def trailheads(self):
+        """登山口らしい場所（駐車場・登山口の点・「登山口」と名の付いた点）。面は重心を使う"""
+        out = []
+        for e in list(self.nodes.values()) + list(self.ways.values()):
+            t = e.get("tags", {}); nm = t.get("name", "")
+            if not (t.get("amenity") == "parking" or t.get("highway") == "trailhead" or "登山口" in nm): continue
+            if e["type"] == "node": p = (e["lon"], e["lat"])
+            else:
+                ps = [self.pos(i) for i in e["nodes"] if i in self.nodes]
+                if not ps: continue
+                p = (sum(x for x, _ in ps)/len(ps), sum(y for _, y in ps)/len(ps))
+            kind = "登山口" if (t.get("highway") == "trailhead" or "登山口" in nm) else "駐車場"
+            out.append({"name": nm, "kind": kind, "pos": p})
+        return out
     def peaks(self):
         out = []
         for n in self.nodes.values():
@@ -342,11 +397,13 @@ def add_elev(pts):
             fx, fy = tile_xy(lo, la, z); keys.add((layer, z, int(fx), int(fy)))
     with ThreadPoolExecutor(8) as ex: list(ex.map(lambda k: _dem_tile(*k), keys))  # 標高タイルを並列で先読み
     zs = [elev(lo, la) for lo, la in pts]
+    nfix = sum(z is None for z in zs)
     good = [z for z in zs if z is not None]
     zs = [z if z is not None else (good[0] if good else 0) for z in zs]
     for i in range(len(zs)):  # 外れ値・欠損の補正（前後7点の中央値から80m以上ずれたら置換）
         med = statistics.median(zs[max(0, i-3):i+4])
-        if abs(zs[i]-med) > 80: zs[i] = med
+        if abs(zs[i]-med) > 80: zs[i] = med; nfix += 1
+    add_elev.last = (nfix, len(zs))
     return [(lo, la, z) for (lo, la), z in zip(pts, zs)]
 
 def updown(p):
@@ -382,7 +439,15 @@ def write_kml(path, title, O, G, wps):
 
 def write_profile(path, title, O, G, wps):
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-    plt.rcParams["font.family"] = ["Noto Sans CJK JP", "DejaVu Sans"]
+    fams = ["Noto Sans CJK JP", "DejaVu Sans"]
+    if FONT and FONT != FONT_DEFAULT:   # 既定の Linux 以外では、見つけたフォントを登録して先頭に置く
+        from matplotlib import font_manager
+        try:
+            font_manager.fontManager.addfont(FONT)
+            fams = [font_manager.FontProperties(fname=FONT).get_name(), "DejaVu Sans"]
+        except Exception:
+            pass
+    plt.rcParams["font.family"] = fams
     cO = [c/1000 for c in cum(O)]; zO = [p[2] for p in O]
     fig, ax = plt.subplots(figsize=(11, 4.6), dpi=130)
     ax.fill_between(cO, zO, min(zO)-50, color="#f4a6a6", alpha=.5)
@@ -432,7 +497,7 @@ def write_map(path, title, O, G, wps, maxw=2200, maxh=1500):
         pg = [P(p) for p in G]
         for i in range(0, len(pg)-1, 2): dr.line([pg[i], pg[i+1]], fill=(0, 90, 255, 235), width=3)
     img = Image.alpha_composite(img, ov); dr = ImageDraw.Draw(img)
-    f13, f15 = ImageFont.truetype(FONT, 15), ImageFont.truetype(FONT, 18)
+    f13, f15 = font(15), font(18)
     for wp in wps[1:-1]:
         x, y = P((wp["lon"], wp["lat"])); dr.ellipse([x-4, y-4, x+4, y+4], fill="black")
         tw = dr.textlength(wp["name"], font=f13); tx = x+7 if x+7+tw < W-6 else x-7-tw   # 右端からはみ出すなら左に置く
@@ -453,10 +518,136 @@ def write_map(path, title, O, G, wps, maxw=2200, maxh=1500):
         if sc/mpp < W*0.25: break
     bx = sc/mpp; dr.rectangle([W-bx-30, H-48, W-20, H-8], fill=(255, 255, 255, 220))
     dr.line([(W-bx-22, H-18), (W-22, H-18)], fill="black", width=4); dr.text((W-bx-22, H-44), f"{sc} m", font=f13, fill="black")
-    dr.text((10, H-24), "地図：国土地理院（地理院タイル）／登山道：© OpenStreetMap contributors, 国土地理院", font=ImageFont.truetype(FONT, 12), fill=(40, 40, 40), stroke_width=2, stroke_fill="white")
+    dr.text((10, H-24), "地図：国土地理院（地理院タイル）／登山道：© OpenStreetMap contributors, 国土地理院", font=font(12), fill=(40, 40, 40), stroke_width=2, stroke_fill="white")
     img = img.convert("RGB"); img.save(path, optimize=True)
     pv = img.copy(); pv.thumbnail((760, 760)); pv.save(path.replace(".png", "_preview.png"), optimize=True)  # 確認用の縮小版
     return z, W, H
+
+# ---------------------------------------------------------------- 自動チェック
+TRAIL_HW = ("path", "footway", "steps")
+ROAD_HW = ("track", "service", "unclassified", "residential")
+BAD_PLACE_KIND = ("camp_site", "village", "hamlet", "locality", "town", "city", "suburb", "neighbourhood", "isolated_dwelling", "farm")
+
+def build_cmd(a, **ov):
+    """今の引数の一部を差し替えた、そのまま実行できるコマンド"""
+    d = {"mountain": a.mountain, "start": a.start, "goal": a.goal, "start_name": a.start_name, "goal_name": a.goal_name,
+         "goal_peak": a.goal_peak, "avoid": a.avoid, "title": a.title}
+    d.update(ov)
+    parts = ["python3", "trailkml.py"]
+    for k, v in d.items():
+        if v: parts += ["--" + k.replace("_", "-"), str(v)]
+    if a.radius != 6.0: parts += ["--radius", str(a.radius)]
+    if a.no_gsi: parts.append("--no-gsi")
+    parts += ["--out", a.out]
+    return " ".join(shlex.quote(x) for x in parts)
+
+def latlon(p): return f"{p[1]:.6f},{p[0]:.6f}"
+
+def run_checks(a, osm, path, ways, O, O2, G2, wps, picked, mt, sd, gd, efix, rep):
+    """結果がおかしい可能性を調べる。[{level: 要確認|参考, code, msg, suggest}]（ルートや出力は変えない）"""
+    C = []
+    def add(level, code, msg, suggest=None): C.append({"level": level, "code": code, "msg": msg, "suggest": suggest})
+    seglen = [hav(O2[i], O2[i+1]) for i in range(len(O2)-1)]
+    total = sum(seglen) or 1
+    hw = [osm.ways[w].get("tags", {}).get("highway", "") for w in ways]
+
+    # ① ROAD_APPROACH：スタートから最初の登山道までの車道・林道
+    road, k = 0.0, 0
+    while k < len(hw) and hw[k] in ROAD_HW: road += seglen[k]; k += 1
+    if road >= 500 or (road > 0 and road >= total*0.2):
+        j = O[min(k, len(O)-1)]
+        # 切り替わる地点から400m以内で、ルートの車道・林道沿い（60m以内）にある駐車場・登山口があれば、そちらを候補にする
+        rd = O2[:k+1] if k > 0 else O2[:2]
+        ths = [t for t in osm.trailheads() if hav(t["pos"], j[:2]) <= 400 and dist_to_line(t["pos"], rd) <= 60]
+        msg = (f"スタートから最初の登山道まで車道・林道を約{road/1000:.2f}km（全体の{road/total*100:.0f}%）通っています。登山口が麓すぎる可能性があります。"
+               f"車道・林道から登山道に切り替わる地点: {latlon(j)} 標高約{j[2]:.0f}m")
+        if ths:
+            th = min(ths, key=lambda t: (t["kind"] != "登山口", hav(t["pos"], j[:2])))
+            msg += f"。その近くの{th['kind']}{('「'+th['name']+'」') if th['name'] else ''}（登山口の候補）: {latlon(th['pos'])} 標高約{elev(*th['pos']) or 0:.0f}m"
+            sug = build_cmd(a, start=latlon(th["pos"]), start_name="登山口（推定）")
+        else:
+            msg += "（ここを登山口の候補とします）"
+            sug = build_cmd(a, start=latlon(j), start_name="登山口（推定）")
+        add("要確認", "ROAD_APPROACH", msg, sug)
+
+    # ② SUMMIT_MISMATCH：終点が本当の山頂でない可能性（--goal 山頂 のとき）
+    pk = picked.get("peaks_all") or []
+    if "goal" in picked and picked["goal"]["by"] == "peak":
+        g = picked["goal"]; why = []
+        if gd > 30: why.append(f"終点が登山道から{gd:.0f}m離れています")
+        top_ele = max((x["ele"] for x in pk), default=0)
+        if top_ele and abs(O[-1][2] - top_ele) > 30: why.append(f"終点の標高（約{O[-1][2]:.0f}m）が山頂候補の最高標高（{top_ele:.0f}m）と{abs(O[-1][2]-top_ele):.0f}m違います")
+        higher = [x for x in pk if x["ele"] > (g.get("ele") or 0) + 5 and hav((x["lon"], x["lat"]), g["pos"]) < 1500]
+        if higher: why.append(f"近く（1.5km以内）に、使った山頂「{g['name']}」より高い山頂候補「{higher[0]['name']}（{higher[0]['ele']:.0f}m）」があります")
+        if why:
+            cands = [(x["name"], x["ele"], latlon((x["lon"], x["lat"]))) for x in pk[:5]]
+            if a.goal_peak: sug = build_cmd(a, goal_peak=None)
+            else:
+                alt = next((x for x in pk if x["name"] != g["name"]), None)
+                sug = build_cmd(a, goal_peak=alt["name"]) if alt else None
+            add("要確認", "SUMMIT_MISMATCH", "終点が本当の山頂でない可能性があります。" + "。".join(why) + f"。山頂候補: {cands}", sug)
+
+    # ③ PLACE_DOUBT：地点名の取り違え
+    for label, jp in (("start", "開始点"), ("goal", "終了点")):
+        p = picked.get(label)
+        if not p or p["by"] == "peak": continue
+        why = []
+        if mt and hav(p["pos"], mt) >= 8000: why.append(f"山の位置から{hav(p['pos'], mt)/1000:.1f}km離れています")
+        if p.get("kind") in BAD_PLACE_KIND: why.append(f"OSMの種類が「{p['kind']}」で、登山口らしくありません")
+        if why:
+            add("要確認", "PLACE_DOUBT", f"{jp}「{p['name']}」（{latlon(p['pos'])}）は取り違えの可能性があります。" + "。".join(why) + f"。他の候補: {p.get('cands') or 'なし'}")
+
+    # ④ DETOUR：遠回り
+    straight = hav(O2[0], O2[-1])
+    if straight > 0 and total/straight > 3:
+        add("参考", "DETOUR", f"ルートの距離（{total/1000:.2f}km）が開始点と終了点の直線距離（{straight/1000:.2f}km）の{total/straight:.1f}倍です。遠回りしている可能性があります")
+
+    # ⑤ GRADIENT：勾配が不自然
+    if O[-1][2] > O[0][2]:
+        u, _ = updown(O); gr = u/total
+        if gr < 0.05 or gr > 0.6:
+            add("参考", "GRADIENT", f"平均勾配（登り累計÷距離）が{gr*100:.0f}%です（目安 5〜60%）。ルートか標高を確認してください")
+
+    # ⑥ CLOSED_NEARBY：廃道・通行止めの道が近い
+    bw, be = min(p[0] for p in O2)-0.003, max(p[0] for p in O2)+0.003
+    bs, bn = min(p[1] for p in O2)-0.003, max(p[1] for p in O2)+0.003
+    far = [p for p in (G2 or []) if dist_to_line(p, O2) > 50]
+    route_ids = set(ways)
+    for wid in osm.closed:
+        if wid in route_ids: continue
+        w = osm.ways[wid]; t = w.get("tags", {})
+        pts = [osm.pos(i) for i in w["nodes"] if i in osm.nodes]
+        if len(pts) < 2 or not any(bw <= x <= be and bs <= y <= bn for x, y in pts): continue
+        samp = []   # 約10mごとに点を打つ
+        for i in range(1, len(pts)):
+            n = max(1, int(hav(pts[i-1], pts[i])/10))
+            samp += [(pts[i-1][0]+(pts[i][0]-pts[i-1][0])*j/n, pts[i-1][1]+(pts[i][1]-pts[i-1][1])*j/n) for j in range(n)]
+        samp.append(pts[-1])
+        nm = t.get("name") or "無名"; tagd = ",".join(k for k in t if "disused" in k or "abandoned" in k)
+        label = f"「{nm}」" + (f"（{tagd}）" if tagd else "")
+        near = [q for q in samp if dist_to_line(q, O2) <= 30]
+        if len(near)*10 >= 100:
+            mid = near[len(near)//2]
+            add("要確認", "CLOSED_NEARBY", f"廃道・通行止めの道{label}が、OSMのルートから30m以内を約{len(near)*10}m並走しています（{latlon(mid)} 付近）。ルートがその道を通っていないか確認してください")
+        hit = [f for f in far if min(hav(f, q) for q in samp) <= 50]
+        if hit:
+            mid = hit[len(hit)//2]
+            add("参考", "CLOSED_NEARBY", f"地理院の線がOSMから50m以上ずれる区間（{latlon(mid)} 付近）が、廃道・通行止めの道{label}の近くを通っています。地理院の線が廃道を通っている可能性があります（メインのOSMのルートには影響しません）")
+
+    # ⑦ ELEV_FIX：標高の補正が多い
+    nfix, n = efix
+    if n and nfix/n > 0.05:
+        add("参考", "ELEV_FIX", f"標高の外れ値・欠損として補正した点が{nfix}/{n}点（{nfix/n*100:.0f}%）あります。登り・下りの数字は不確かです")
+
+    # ⑧ NO_WAYPOINTS：途中の地点がない
+    if len(wps) <= 2:
+        add("参考", "NO_WAYPOINTS", "途中の地点情報がありません。公開されている山行記録の合目などで補うとよいです")
+
+    # 参考：開始点・終了点が登山道から離れている（②の対象は除く）
+    if sd > 30: add("参考", "SNAP_FAR", f"開始点から登山道まで{sd:.0f}m離れています")
+    if gd > 30 and not any(c["code"] == "SUMMIT_MISMATCH" for c in C):
+        add("参考", "SNAP_FAR", f"終了点から登山道まで{gd:.0f}m離れています（山頂の点の位置や、山頂直下の道がデータにない可能性）")
+    return C
 
 # ---------------------------------------------------------------- メイン
 def main():
@@ -471,6 +662,7 @@ def main():
     ap.add_argument("--no-gsi", action="store_true")
     a = ap.parse_args()
     rep = {"warnings": []}
+    if not FONT: print("警告: 日本語フォントが見つかりません。経路図の文字が正しく表示されない可能性があります", file=sys.stderr)
 
     SUMMIT = ("山頂", "summit", "頂上")
     sp = parse_point(a.start); gp = None if a.goal in SUMMIT else parse_point(a.goal)
@@ -501,14 +693,18 @@ def main():
     t0 = time.time(); osm = OSM(osm_fetch(w, s, e, n), a.avoid)
     rep["osm_fetch_sec"] = round(time.time()-t0, 1)
     named = osm.named()
+    picked = {}   # チェック用：地点名・山頂から決めた地点
 
     def resolve(label, given, cand_label):
         p = parse_point(given)
         if p: return p, cand_label or ("スタート" if label == "start" else "ゴール")
-        if label in pre: return pre[label][0], cand_label or pre[label][1]
+        if label in pre:
+            picked[label] = {"by": "gsi", "name": pre[label][1], "kind": "", "pos": pre[label][0], "cands": PLACE_CANDS.get(given, [])}
+            return pre[label][0], cand_label or pre[label][1]
         if given in SUMMIT:
             pk = osm.peaks()
             if mt: pk = [x for x in pk if hav((x["lon"], x["lat"]), mt) < 2500] or pk   # 山名の位置の近くの山頂に絞る（隣の高い山を選ばない）
+            picked["peaks_all"] = list(pk)
             if a.goal_peak: pk = [x for x in pk if a.goal_peak in x["name"]] or pk
             if not pk: sys.exit("範囲内に山頂（natural=peak）が見つかりません。終了点を座標で指定してください")
             top = pk[0]
@@ -520,6 +716,7 @@ def main():
             if near_top:
                 rep["warnings"].append(f"最高点の点「{top['name']}」の近くに「{near_top[0]['name']}」があり、こちらを山頂として使いました")
                 top = dict(near_top[0], ele=near_top[0].get("ele") or top["ele"])
+            picked[label] = {"by": "peak", "name": top["name"], "ele": top["ele"], "pos": (top["lon"], top["lat"])}
             return (top["lon"], top["lat"]), cand_label or f"{top['name']}（{top['ele']:.0f}m）"
         hits = [x for x in named if x["name"] == given] or [x for x in named if given in x["name"]]
         if not hits: sys.exit(f"「{given}」が地名検索にもOSMの地点名にも見つかりません。座標で指定してください")
@@ -528,6 +725,8 @@ def main():
         rep.setdefault("name_candidates", {})[label] = [(h["name"], h["kind"], round(h["lon"], 6), round(h["lat"], 6)) for h in hits[:8]]
         if len({(round(h['lon'], 3), round(h['lat'], 3)) for h in hits}) > 1:
             rep["warnings"].append(f"「{given}」に該当する地点が複数あり、登山口・小屋などを優先し山に近い候補を使いました: {rep['name_candidates'][label][:4]}")
+        picked[label] = {"by": "osm", "name": hits[0]["name"], "kind": hits[0]["kind"], "pos": (hits[0]["lon"], hits[0]["lat"]),
+                         "cands": rep["name_candidates"][label][1:6]}
         return (hits[0]["lon"], hits[0]["lat"]), cand_label or hits[0]["name"]
 
     SP, sname = resolve("start", a.start, a.start_name)
@@ -565,7 +764,7 @@ def main():
                 if far: rep["gsi"]["far_points_sample"] = [(round(p[0], 5), round(p[1], 5)) for p in far[::max(1, len(far)//5)]]
             else: rep["warnings"].append("地理院の登山道では開始点と終了点がつながりませんでした")
 
-    O = add_elev(O2); G = add_elev(G2) if G2 else None
+    O = add_elev(O2); efix = add_elev.last; G = add_elev(G2) if G2 else None
     cO = cum(O)
     wps = [{"name": sname, "lon": O[0][0], "lat": O[0][1], "ele": O[0][2], "km": 0.0}]
     lo_, la_ = [p[0] for p in O2], [p[1] for p in O2]
@@ -600,6 +799,7 @@ def main():
                ele_max=max(p[2] for p in O), waypoints=[(w["name"], round(w["km"], 2), round(w["ele"]), "gsi" if w.get("note") else "osm") for w in wps],
                map_zoom=zinfo[0], map_size=zinfo[1:], files=[f"{a.out}.kml", f"{a.out}_map.png", f"{a.out}_profile.png"])
     if G: rep["gsi"]["up_m"], rep["gsi"]["down_m"] = [round(v) for v in updown(G)]
+    rep["checks"] = run_checks(a, osm, path, ways, O, O2, G2, wps, picked, mt, sd, gd, efix, rep)
     json.dump(rep, open(f"{a.out}_report.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     # 画面には要点だけ出す（詳細は _report.json）
     g = rep.get("gsi", {})
@@ -610,6 +810,9 @@ def main():
     print("経路:", " > ".join(rep["osm_sequence"]))
     print("地点:", " / ".join(f"{n} {k}km {e}m{'*' if src == 'gsi' else ''}" for n, k, e, src in rep["waypoints"]))
     for wmsg in rep["warnings"]: print("警告:", wmsg[:300])
+    for c in sorted(rep["checks"], key=lambda c: c["level"] != "要確認"):
+        print(f"{c['level']}: [{c['code']}] {c['msg'][:400]}")
+        if c.get("suggest"): print(f"提案: {c['suggest']}")
 
 if __name__ == "__main__":
     main()
