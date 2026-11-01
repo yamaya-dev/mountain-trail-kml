@@ -11,7 +11,7 @@ OSM（api.openstreetmap.org）と国土地理院（cyberjapandata.gsi.go.jp）�
   山名は地理院の地名検索で位置を決める（同名の山は標高が最も高いものを使う）。
 """
 import argparse, heapq, io, json, math, os, re, shlex, statistics, subprocess, sys, time
-VERSION = "2.2"
+VERSION = "2.3"
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -526,6 +526,7 @@ def write_map(path, title, O, G, wps, maxw=2200, maxh=1500):
 # ---------------------------------------------------------------- 自動チェック
 TRAIL_HW = ("path", "footway", "steps")
 ROAD_HW = ("track", "service", "unclassified", "residential")
+PLACE_SHIFT_M = 150   # 地名検索とOSMの同名地点がこれ以上離れていたらOSMを使う
 BAD_PLACE_KIND = ("camp_site", "village", "hamlet", "locality", "town", "city", "suburb", "neighbourhood", "isolated_dwelling", "farm")
 
 def build_cmd(a, **ov):
@@ -585,7 +586,10 @@ def run_checks(a, osm, path, ways, O, O2, G2, wps, picked, mt, sd, gd, efix, rep
             else:
                 alt = next((x for x in pk if x["name"] != g["name"]), None)
                 sug = build_cmd(a, goal_peak=alt["name"]) if alt else None
-            add("要確認", "SUMMIT_MISMATCH", "終点が本当の山頂でない可能性があります。" + "。".join(why) + f"。山頂候補: {cands}", sug)
+            if a.goal_peak and a.goal_peak in g["name"]:   # 山頂を名前で指定し、そのとおりに決まったときは参考にとどめる
+                add("参考", "SUMMIT_MISMATCH", f"--goal-peak の指定どおり「{g['name']}」を終点にしました。" + "。".join(why) + f"。山頂候補: {cands}")
+            else:
+                add("要確認", "SUMMIT_MISMATCH", "終点が本当の山頂でない可能性があります。" + "。".join(why) + f"。山頂候補: {cands}", sug)
 
     # ③ PLACE_DOUBT：地点名の取り違え
     for label, jp in (("start", "開始点"), ("goal", "終了点")):
@@ -596,6 +600,12 @@ def run_checks(a, osm, path, ways, O, O2, G2, wps, picked, mt, sd, gd, efix, rep
         if p.get("kind") in BAD_PLACE_KIND: why.append(f"OSMの種類が「{p['kind']}」で、登山口らしくありません")
         if why:
             add("要確認", "PLACE_DOUBT", f"{jp}「{p['name']}」（{latlon(p['pos'])}）は取り違えの可能性があります。" + "。".join(why) + f"。他の候補: {p.get('cands') or 'なし'}")
+
+    # ③' PLACE_SHIFT：地名検索の位置をOSMの位置に置き換えた
+    for label, jp in (("start", "開始点"), ("goal", "終了点")):
+        p = picked.get(label)
+        if p and p.get("shift"):
+            add("参考", "PLACE_SHIFT", f"{jp}「{p['name']}」は、地名検索の位置（{latlon(p['shift']['gsi'])}）がOSMの位置（{latlon(p['pos'])}）と{p['shift']['m']}m離れていたため、OSMの位置を使いました")
 
     # ④ DETOUR：遠回り
     straight = hav(O2[0], O2[-1])
@@ -699,6 +709,17 @@ def main():
         p = parse_point(given)
         if p: return p, cand_label or ("スタート" if label == "start" else "ゴール")
         if label in pre:
+            # 地名検索の施設の点は、実物から数百mずれていることがある（例：浄土平ビジターセンターは約580m西）。
+            # OSMに同じ名前の地点（建物の面・点）があり、PLACE_SHIFT_M 以上離れていれば、OSMの位置を使う
+            gp_, gt = pre[label]
+            same = [x for x in named if x["name"] in (given, gt)]
+            if same:
+                o = min(same, key=lambda x: hav((x["lon"], x["lat"]), gp_)); op = (o["lon"], o["lat"]); dd = hav(op, gp_)
+                if dd >= PLACE_SHIFT_M:
+                    picked[label] = {"by": "osm", "name": o["name"], "kind": o["kind"], "pos": op, "cands": PLACE_CANDS.get(given, []),
+                                     "shift": {"gsi": gp_, "m": round(dd)}}
+                    rep["warnings"].append(f"「{given}」の地名検索の位置（{latlon(gp_)}）がOSMの「{o['name']}」（{latlon(op)}）と{dd:.0f}m離れていたため、OSMの位置を使いました")
+                    return op, cand_label or o["name"]
             picked[label] = {"by": "gsi", "name": pre[label][1], "kind": "", "pos": pre[label][0], "cands": PLACE_CANDS.get(given, [])}
             return pre[label][0], cand_label or pre[label][1]
         if given in SUMMIT:
