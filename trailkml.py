@@ -11,7 +11,7 @@ OSM（api.openstreetmap.org）と国土地理院（cyberjapandata.gsi.go.jp）�
   山名は地理院の地名検索で位置を決める（同名の山は標高が最も高いものを使う）。
 """
 import argparse, heapq, io, json, math, os, re, shlex, statistics, subprocess, sys, time
-VERSION = "2.3"
+VERSION = "2.4"
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -175,10 +175,36 @@ def locate_place(name, center, max_km=15):
     return lo, la, t
 
 # ---------------------------------------------------------------- OSM
+_WAY_KEYS = ("highway", "disused:highway", "abandoned:highway", "was:highway", "name")
+def osm_slim(els):
+    """使うものだけ残す（メモリ対策）。OSM API は範囲内の建物・その頂点まで全部返すので、市街地に近い山では
+    数十万点になり、メモリ 1GB の機械を使い切った（2026-11）。残すのは
+      ・道（今の道・廃道）、名前のある面、駐車場 … 経路・通行止めの確認・地点名・登山口に使う
+      ・タグのある点（山頂・登山口・名前のある地点）と、残した道・面の頂点
+    点・道とも id・座標・タグ以外（更新者・日時など）は捨てる。経路・地点の結果は変わらない"""
+    ways = []; keep = set()
+    for e in els:
+        if e["type"] != "way": continue
+        t = e.get("tags") or {}
+        if not (any(k in t for k in _WAY_KEYS) or t.get("amenity") == "parking"): continue
+        ways.append({"type": "way", "id": e["id"], "nodes": e["nodes"], "tags": t}); keep.update(e["nodes"])
+    nodes = []
+    for e in els:
+        if e["type"] != "node": continue
+        t = e.get("tags")
+        if not t and e["id"] not in keep: continue
+        n = {"type": "node", "id": e["id"], "lon": e["lon"], "lat": e["lat"]}
+        if t: n["tags"] = t
+        nodes.append(n)
+    return nodes + ways
+
 def osm_fetch(w, s, e, n):
-    """OSM API map.json。範囲が大きすぎる・ノード数超過のときは4分割して統合"""
+    """OSM API map.json。範囲が大きすぎる・ノード数超過のときは4分割して統合。
+    1 回分を読み込むたびに osm_slim で使うものだけにする（全体を一度に抱えない）"""
     r = S.get("https://api.openstreetmap.org/api/0.6/map.json", params={"bbox": f"{w},{s},{e},{n}"}, timeout=90)
-    if r.status_code == 200: return r.json()["elements"]
+    if r.status_code == 200:
+        els = json.loads(r.content)["elements"]; r.close(); del r
+        return osm_slim(els)
     if r.status_code in (400, 509) and (e-w) > 0.01:
         mx, my = (w+e)/2, (s+n)/2; els = {}
         for b in [(w, s, mx, my), (mx, s, e, my), (w, my, mx, n), (mx, my, e, n)]:
